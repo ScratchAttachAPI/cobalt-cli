@@ -251,7 +251,7 @@ class ProjectBuilder:
         self.list_ids = {name: stable_id("list:" + name) for name in (
             "weights", "vocab", "work", "logits", "tokens", "x", "norm", "qkv",
             "attention", "hidden", "scores", "probabilities", "scaled",
-            "keyCache", "valueCache",
+            "keyCache", "valueCache", "weightScales", "bitPowers",
         )}
 
     def new_id(self):
@@ -908,6 +908,7 @@ def make_native_project(tensors, vocab):
 
 
 def make_full_native_project(tensors, vocab):
+    torch = __import__("torch")
     builder = ProjectBuilder()
     code = ScratchCode(builder)
     V = code.var
@@ -917,13 +918,84 @@ def make_full_native_project(tensors, vocab):
     L = code.length
     tensor_info = {}
     weights = []
+    weight_scales = []
+    row_scales = {}
+    for name, tensor in tensors.items():
+        if tensor.ndim != 2:
+            continue
+        rows = tensor.detach().cpu().float().reshape(tensor.shape[0], -1)
+        peaks = rows.abs().amax(dim=1)
+        bias_name = name[:-7] + ".bias" if name.endswith(".weight") else ""
+        if bias_name in tensors and tensors[bias_name].numel() == len(peaks):
+            peaks = torch.maximum(peaks, tensors[bias_name].detach().cpu().float().abs())
+        row_scales[name] = torch.where(peaks > 0, peaks / 3, torch.ones_like(peaks))
+
+    logical_offset = 0
+    pending_bits = 0
+    pending_count = 0
     for name, tensor in tensors.items():
         flat = tensor.detach().cpu().float().reshape(-1)
-        maximum = float(flat.abs().max().item()) if flat.numel() else 0.0
-        scale = maximum / 127 if maximum else 1.0
-        quantized = (flat / scale).round().clamp(-127, 127).to(dtype=__import__("torch").int8).tolist()
-        tensor_info[name] = {"offset": len(weights), "scale": scale, "size": flat.numel()}
-        weights.extend(quantized)
+        bias_weight = name[:-5] + ".weight" if name.endswith(".bias") else ""
+        if name in row_scales:
+            scales = row_scales[name]
+            rows = flat.reshape(tensor.shape[0], -1)
+            quantized = (rows / scales[:, None]).round().clamp(-3, 3).to(dtype=torch.int8).reshape(-1).tolist()
+            scale_offset = len(weight_scales)
+            weight_scales.extend(scales.tolist())
+            tensor_info[name] = {
+                "offset": logical_offset,
+                "scale_offset": scale_offset,
+                "row_width": rows.shape[1],
+                "size": flat.numel(),
+            }
+        elif bias_weight in row_scales:
+            scales = row_scales[bias_weight]
+            quantized = (flat / scales).round().clamp(-3, 3).to(dtype=torch.int8).tolist()
+            tensor_info[name] = {
+                "offset": logical_offset,
+                "scale_offset": tensor_info[bias_weight]["scale_offset"],
+                "size": flat.numel(),
+            }
+        else:
+            maximum = float(flat.abs().max().item()) if flat.numel() else 0.0
+            scale = maximum / 3 if maximum else 1.0
+            quantized = (flat / scale).round().clamp(-3, 3).to(dtype=torch.int8).tolist()
+            scale_offset = len(weight_scales)
+            weight_scales.append(scale)
+            tensor_info[name] = {"offset": logical_offset, "scale_offset": scale_offset, "size": flat.numel()}
+        logical_offset += flat.numel()
+        for value in quantized:
+            pending_bits |= (value + 3) << (3 * pending_count)
+            pending_count += 1
+            if pending_count == 8:
+                weights.append(pending_bits)
+                pending_bits = 0
+                pending_count = 0
+    if pending_count:
+        weights.append(pending_bits)
+
+    def read_weight(name, index):
+        info = tensor_info[name]
+        absolute_index = O("operator_add", info["offset"], index) if not isinstance(index, int) else info["offset"] + index
+        packed_index = O("operator_add", M("floor", O("operator_divide", absolute_index, 8)), 1)
+        packed_value = I("weights", packed_index)
+        power_index = O("operator_add", O("operator_mod", absolute_index, 8), 1)
+        power = I("bitPowers", power_index)
+        packed_value = M("floor", O("operator_divide", packed_value, power))
+        return O("operator_subtract", O("operator_mod", packed_value, 8), 3)
+
+    def weight_scale(name, row_index):
+        info = tensor_info[name]
+        if "scale" in info:
+            return info["scale"]
+        if isinstance(row_index, int):
+            return I("weightScales", info["scale_offset"] + row_index + 1)
+        return I("weightScales", O("operator_add", info["scale_offset"] + 1, row_index))
+
+    def tensor_scale(name, flat_index):
+        info = tensor_info[name]
+        row = M("floor", O("operator_divide", flat_index, info.get("row_width", 1)))
+        return weight_scale(name, row)
 
     def command(chain, opcode, fields=None, parent=None):
         return code.command(chain, opcode, fields=fields, parent=parent)
@@ -1065,65 +1137,42 @@ def make_full_native_project(tensors, vocab):
     if_block(chain, O("operator_equals", L("tokens"), 0), supply_unknown_seed)
 
     def tensor_value(name, index):
-        info = tensor_info[name]
         return O(
             "operator_multiply",
-            I("weights", info["offset"] + index + 1),
-            info["scale"],
+            read_weight(name, index),
+            tensor_scale(name, index),
         )
 
-    def linear(chain, weight_name, bias_name, input_list, output_list, input_width, output_width, row_count, input_base=0, input_positions=None):
+    def linear(chain, weight_name, bias_name, input_list, output_list, input_width, output_width, row_count):
         weight = tensor_info[weight_name]
         bias = tensor_info[bias_name] if bias_name else None
-        if input_positions is None:
-            input_positions = L("tokens")
-        set_value(chain, "scaleIndex", 0)
-
-        def scale_activation(scale_chain, _):
-            index = O("operator_add", V("scaleIndex"), 1)
-            source_index = O("operator_add", input_base, index)
-            scaled_value = O(
-                "operator_multiply",
-                I(input_list, source_index),
-                weight["scale"],
-            )
-            replace(scale_chain, "scaled", index, scaled_value)
-            change(scale_chain, "scaleIndex")
-
-        repeat(chain, O("operator_multiply", input_positions, input_width), scale_activation)
         set_value(chain, "row", 0)
 
         def each_row(row_chain, _):
             row_in_matrix = O("operator_mod", V("row"), output_width)
+            row_scale = weight_scale(weight_name, row_in_matrix)
             if bias:
-                bias_index = O("operator_add", bias["offset"] + 1, row_in_matrix)
                 set_value(row_chain, "acc", O(
-                    "operator_multiply", I("weights", bias_index), bias["scale"],
+                    "operator_multiply", read_weight(bias_name, row_in_matrix), row_scale,
                 ))
             else:
                 set_value(row_chain, "acc", 0)
             set_value(row_chain, "col", 0)
 
             def each_column(column_chain, _):
-                weight_index = O(
-                    "operator_add",
-                    weight["offset"] + 1,
-                    O("operator_add", O(
-                        "operator_multiply", row_in_matrix, input_width,
-                    ), V("col")),
-                )
+                weight_index = O("operator_add", O(
+                    "operator_multiply", row_in_matrix, input_width,
+                ), V("col"))
                 position = M("floor", O("operator_divide", V("row"), output_width))
-                activation_index = O(
-                    "operator_add", O("operator_multiply", position, input_width), O("operator_add", V("col"), 1),
-                )
-                set_value(column_chain, "weightValue", I("weights", weight_index))
-                set_value(column_chain, "inputValue", I("scaled", activation_index))
+                activation_index = O("operator_add", O("operator_multiply", position, input_width), O("operator_add", V("col"), 1))
+                set_value(column_chain, "weightValue", read_weight(weight_name, weight_index))
+                set_value(column_chain, "inputValue", I(input_list, activation_index))
                 change(column_chain, "acc", O("operator_multiply", V("weightValue"), V("inputValue")))
                 change(column_chain, "col")
 
             repeat(row_chain, input_width, each_column)
             output_index = O("operator_add", V("row"), 1)
-            replace(row_chain, output_list, output_index, V("acc"))
+            replace(row_chain, output_list, output_index, O("operator_multiply", V("acc"), row_scale))
             change(row_chain, "row")
 
         repeat(chain, row_count, each_row)
@@ -1164,10 +1213,8 @@ def make_full_native_project(tensors, vocab):
                 index = O("operator_add", O("operator_multiply", V("pos"), EMBED_DIM), O("operator_add", V("col"), 1))
                 centered = O("operator_subtract", I(input_list, index), V("mean"))
                 normalized = O("operator_divide", centered, V("stddev"))
-                gamma_index = O("operator_add", gamma["offset"] + 1, V("col"))
-                beta_index = O("operator_add", beta["offset"] + 1, V("col"))
-                gamma_value = O("operator_multiply", I("weights", gamma_index), gamma["scale"])
-                beta_value = O("operator_multiply", I("weights", beta_index), beta["scale"])
+                gamma_value = O("operator_multiply", read_weight(tensor_prefix + ".weight", V("col")), weight_scale(tensor_prefix + ".weight", V("col")))
+                beta_value = O("operator_multiply", read_weight(tensor_prefix + ".bias", V("col")), weight_scale(tensor_prefix + ".bias", V("col")))
                 result = O("operator_add", O("operator_multiply", normalized, gamma_value), beta_value)
                 replace(normalize_chain, output_list, index, result)
                 change(normalize_chain, "col")
@@ -1222,10 +1269,14 @@ def make_full_native_project(tensors, vocab):
             def each_column(column_chain, _):
                 token_index = O("operator_add", O("operator_multiply", V("tokenValue"), EMBED_DIM), O("operator_add", V("col"), 1))
                 pos_index = O("operator_add", O("operator_multiply", V("pos"), EMBED_DIM), O("operator_add", V("col"), 1))
-                token_weight_index = O("operator_add", embedding["offset"] + 1, token_index)
-                position_weight_index = O("operator_add", positions["offset"] + 1, pos_index)
-                token_value = O("operator_multiply", I("weights", token_weight_index), embedding["scale"])
-                position_value = O("operator_multiply", I("weights", position_weight_index), positions["scale"])
+                token_index = O(
+                    "operator_add", O("operator_multiply", V("tokenValue"), EMBED_DIM), V("col"),
+                )
+                position_index = O(
+                    "operator_add", O("operator_multiply", V("pos"), EMBED_DIM), V("col"),
+                )
+                token_value = O("operator_multiply", read_weight("token_embedding.weight", token_index), tensor_scale("token_embedding.weight", token_index))
+                position_value = O("operator_multiply", read_weight("position_embedding.weight", position_index), tensor_scale("position_embedding.weight", position_index))
                 replace(column_chain, "x", pos_index, O("operator_add", token_value, position_value))
                 change(column_chain, "col")
 
@@ -1402,14 +1453,10 @@ def make_full_native_project(tensors, vocab):
         set_value(chain, "col", 0)
 
         def add_embedding(embedding_chain, _):
-            token_index = O("operator_add", embedding["offset"] + 1, O(
-                "operator_add", O("operator_multiply", V("tokenValue"), EMBED_DIM), V("col"),
-            ))
-            position_index = O("operator_add", positions["offset"] + 1, O(
-                "operator_add", O("operator_multiply", V("cacheLen"), EMBED_DIM), V("col"),
-            ))
-            token_value = O("operator_multiply", I("weights", token_index), embedding["scale"])
-            position_value = O("operator_multiply", I("weights", position_index), positions["scale"])
+            token_index = O("operator_add", O("operator_multiply", V("tokenValue"), EMBED_DIM), V("col"))
+            position_index = O("operator_add", O("operator_multiply", V("cacheLen"), EMBED_DIM), V("col"))
+            token_value = O("operator_multiply", read_weight("token_embedding.weight", token_index), tensor_scale("token_embedding.weight", token_index))
+            position_value = O("operator_multiply", read_weight("position_embedding.weight", position_index), tensor_scale("position_embedding.weight", position_index))
             replace(embedding_chain, "x", O("operator_add", V("col"), 1), O("operator_add", token_value, position_value))
             change(embedding_chain, "col")
 
@@ -1438,7 +1485,6 @@ def make_full_native_project(tensors, vocab):
             linear(
                 chain, prefix + "attention.qkv.weight", prefix + "attention.qkv.bias",
                 "norm", "qkv", EMBED_DIM, 3 * EMBED_DIM, 3 * EMBED_DIM,
-                input_positions=1,
             )
 
             key_cache_base = layer * CONTEXT_LENGTH * EMBED_DIM
@@ -1458,20 +1504,17 @@ def make_full_native_project(tensors, vocab):
             linear(
                 chain, prefix + "attention.proj.weight", prefix + "attention.proj.bias",
                 "attention", "norm", EMBED_DIM, EMBED_DIM, EMBED_DIM,
-                input_positions=1,
             )
             residual(chain, EMBED_DIM)
             layer_norm(chain, "x", "norm", prefix + "ln2", 1)
             linear(
                 chain, prefix + "ffn.net.0.weight", prefix + "ffn.net.0.bias",
                 "norm", "hidden", EMBED_DIM, FFN_DIM, FFN_DIM,
-                input_positions=1,
             )
             gelu_hidden(chain, FFN_DIM)
             linear(
                 chain, prefix + "ffn.net.2.weight", prefix + "ffn.net.2.bias",
                 "hidden", "norm", FFN_DIM, EMBED_DIM, EMBED_DIM,
-                input_positions=1,
             )
             residual(chain, EMBED_DIM)
 
@@ -1479,7 +1522,6 @@ def make_full_native_project(tensors, vocab):
         linear(
             chain, "token_embedding.weight", None,
             "norm", "logits", EMBED_DIM, OUTPUT_VOCAB_SIZE, OUTPUT_VOCAB_SIZE,
-            input_positions=1,
         )
 
     def generate_token(generation_chain, _):
@@ -1647,6 +1689,8 @@ def make_full_native_project(tensors, vocab):
     }
     list_values = {
         "weights": weights,
+        "weightScales": weight_scales,
+        "bitPowers": [1, 8, 64, 512, 4096, 32768, 262144, 2097152],
         "vocab": vocab,
         "tokens": [],
         "x": [0] * EMBED_DIM,
@@ -1654,7 +1698,6 @@ def make_full_native_project(tensors, vocab):
         "qkv": [0] * (3 * EMBED_DIM),
         "attention": [0] * EMBED_DIM,
         "hidden": [0] * FFN_DIM,
-        "scaled": [0] * max(FFN_DIM, EMBED_DIM),
         "logits": [0] * OUTPUT_VOCAB_SIZE,
         "probabilities": [0] * OUTPUT_VOCAB_SIZE,
         "scores": [0] * CONTEXT_LENGTH,
@@ -1736,7 +1779,7 @@ def make_full_native_project(tensors, vocab):
         }], "extensions": [],
         "meta": {"semver": "3.0.0", "vm": "0.2.0", "agent": "native-tinygpt-5m"},
     }
-    return project, stage_svg, sprite_svg, sum(tensor_info[name]["size"] for name in tensor_info)
+    return project, stage_svg, sprite_svg, progress_svg, sum(tensor_info[name]["size"] for name in tensor_info)
 
 
 def make_turbowarp_project(torch, tensors, vocab):
@@ -1944,29 +1987,36 @@ def export(args):
     if len(vocab) != VOCAB_SIZE or any(word is None for word in vocab):
         raise ValueError(f"The source vocabulary must contain at least {VOCAB_SIZE} contiguous token IDs")
     tensors = build_state(torch, state)
-    project, stage_svg, progress_svg, sprite_svg, extension_source, parameter_count = make_turbowarp_project(torch, tensors, vocab)
-    output_path = Path(args.output)
-    extension_path = Path(args.extension_output)
+    output_path = Path(args.output or ("tinygpt_scratch_compressed.sb3" if args.mode == "native" else "tinygpt_turbowarp.sb3"))
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    extension_path.parent.mkdir(parents=True, exist_ok=True)
-    extension_path.write_text(extension_source, encoding="utf-8")
-    with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+    compression_level = 9 if args.mode == "native" else 6
+    if args.mode == "native":
+        project, stage_svg, sprite_svg, progress_svg, parameter_count = make_full_native_project(tensors, vocab)
+        extension_path = None
+    else:
+        project, stage_svg, progress_svg, sprite_svg, extension_source, parameter_count = make_turbowarp_project(torch, tensors, vocab)
+        extension_path = Path(args.extension_output)
+        extension_path.parent.mkdir(parents=True, exist_ok=True)
+        extension_path.write_text(extension_source, encoding="utf-8")
+    with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED, compresslevel=compression_level) as archive:
         archive.writestr("project.json", json.dumps(project, separators=(",", ":"), ensure_ascii=False, allow_nan=False))
         archive.writestr(costume(stage_svg, "backdrop1", 240, 180)["md5ext"], stage_svg)
-        archive.writestr(costume(progress_svg, "progress", 0, 7)["md5ext"], progress_svg)
         archive.writestr(costume(sprite_svg, "blank", 0.5, 0.5)["md5ext"], sprite_svg)
+        archive.writestr(costume(progress_svg, "progress", 0, 7)["md5ext"], progress_svg)
     project_json_size = len(json.dumps(project, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
-    print(f"TurboWarp project: {output_path}")
-    print(f"Custom extension: {extension_path}")
+    print(f"{'Native Scratch' if args.mode == 'native' else 'TurboWarp'} project: {output_path}")
+    if extension_path:
+        print(f"Custom extension: {extension_path}")
     print(f"Model: {parameter_count:,} unique parameters; {NUM_LAYERS} layers; full vocabulary ({len(vocab)} tokens)")
     print(f"project.json: {project_json_size:,} bytes; generated tokens: {GENERATION_TOKENS}")
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Export TinyGPT as a fast TurboWarp project and optimized custom extension.")
+    parser = argparse.ArgumentParser(description="Export TinyGPT as native Scratch blocks or a fast TurboWarp project.")
     parser.add_argument("checkpoint", nargs="?", default="tinygpt.pt")
     parser.add_argument("--vocab", default="vocab.json")
-    parser.add_argument("--output", default="tinygpt_turbowarp.sb3")
+    parser.add_argument("--mode", choices=("native", "turbowarp"), default="native")
+    parser.add_argument("--output", default=None)
     parser.add_argument("--extension-output", default="tinygpt_turbowarp_extension.js")
     return parser.parse_args()
 
