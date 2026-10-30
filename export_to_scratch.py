@@ -241,7 +241,7 @@ class ProjectBuilder:
         self.variable_ids = {name: stable_id("var:" + name) for name in (
             "tokenA", "tokenB", "bestToken", "bestScore", "scanIndex",
             "promptText", "currentWord", "currentChar", "promptToken", "storyText",
-            "progressText", "generationStep", "generationProgress",
+            "progressText", "progressBar", "progressCell", "generationStep", "generationProgress",
             "pos", "row", "col", "acc", "mean", "variance", "delta", "stddev",
             "head", "query", "key", "feature", "channel", "tokenValue", "tempValue",
             "sumExp", "maxScore", "weightValue", "inputValue", "expValue", "candidate",
@@ -393,7 +393,7 @@ class ProjectBuilder:
 class ScratchCode:
     """Build native Scratch commands and reporter trees for loop-based inference."""
 
-    STRING_VARIABLES = {"promptText", "currentWord", "currentChar", "storyText", "progressText"}
+    STRING_VARIABLES = {"promptText", "currentWord", "currentChar", "storyText", "progressText", "progressBar"}
     STRING_LISTS = {"vocab"}
     BOOLEAN_OPS = {"operator_equals", "operator_gt", "operator_lt", "operator_and", "operator_or", "operator_not"}
     BINARY_INPUTS = {
@@ -944,6 +944,31 @@ def make_full_native_project(tensors, vocab):
     def repeat(chain, times, build_body):
         return code.repeat(chain, times, build_body)
 
+    def update_progress_bar(chain):
+        set_value(chain, "progressBar", code.text("\u2591" * 20))
+        set_value(chain, "progressCell", 1)
+        filled_cells = M("floor", O("operator_divide", V("generationProgress"), 5))
+
+        def append_cell(cell_chain, _):
+            condition = code.unary(
+                "operator_not", O("operator_gt", V("progressCell"), filled_cells),
+            )
+
+            def append_filled(filled_chain, _):
+                set_value(filled_chain, "progressBar", O(
+                    "operator_join", V("progressBar"), code.text("\u2588"),
+                ))
+
+            branch = if_block(cell_chain, condition, append_filled, opcode="control_if_else")
+            empty_chain = []
+            set_value(empty_chain, "progressBar", O(
+                "operator_join", V("progressBar"), code.text("\u2591"),
+            ))
+            builder.blocks[branch]["inputs"]["SUBSTACK2"] = [2, empty_chain[0]]
+            builder.blocks[empty_chain[0]]["parent"] = branch
+
+        repeat(chain, 20, append_cell)
+
     def replace(chain, list_name, index, value):
         return code.replace_item(chain, list_name, index, value)
 
@@ -1407,6 +1432,7 @@ def make_full_native_project(tensors, vocab):
                     O("operator_divide", completed, GENERATION_TOKENS),
                     100,
                 ))
+                update_progress_bar(chain)
             prefix = f"blocks.{layer}."
             layer_norm(chain, "x", "norm", prefix + "ln1", 1)
             linear(
@@ -1530,6 +1556,7 @@ def make_full_native_project(tensors, vocab):
         ))
 
     set_value(chain, "generationProgress", 0)
+    set_value(chain, "progressBar", code.text("\u2591" * 20))
     set_value(chain, "cacheLen", 0)
     set_value(chain, "prefillIndex", 0)
 
@@ -1691,10 +1718,210 @@ def make_full_native_project(tensors, vocab):
             "sliderMin": 0,
             "sliderMax": 100,
             "isDiscrete": False,
+        }, {
+            "id": builder.variable_ids["progressBar"],
+            "mode": "large",
+            "opcode": "data_variable",
+            "params": {"VARIABLE": builder.variable_ids["progressBar"]},
+            "spriteName": "TinyGPT Scratch",
+            "value": "░" * 20,
+            "width": 300,
+            "height": 35,
+            "x": 5,
+            "y": 170,
+            "visible": True,
+            "sliderMin": 0,
+            "sliderMax": 100,
+            "isDiscrete": True,
         }], "extensions": [],
         "meta": {"semver": "3.0.0", "vm": "0.2.0", "agent": "native-tinygpt-5m"},
     }
     return project, stage_svg, sprite_svg, sum(tensor_info[name]["size"] for name in tensor_info)
+
+
+def make_turbowarp_project(torch, tensors, vocab):
+    import base64
+
+    variable_ids = {
+        name: stable_id("fast-var:" + name)
+        for name in ("storyText", "progressText", "progressBar", "generationProgress")
+    }
+    tensor_info = {}
+    encoded_chunks = []
+    pending = b""
+    offset = 0
+    for name, tensor in tensors.items():
+        flat = tensor.detach().cpu().float().reshape(-1)
+        maximum = float(flat.abs().max().item()) if flat.numel() else 0.0
+        scale = maximum / 127 if maximum else 1.0
+        quantized = (flat / scale).round().clamp(-127, 127).to(dtype=torch.int8).contiguous()
+        tensor_info[name] = {"offset": offset, "scale": scale, "size": quantized.numel()}
+        offset += quantized.numel()
+        for start in range(0, quantized.numel(), 65_535):
+            raw = bytes(value & 255 for value in quantized[start:start + 65_535].tolist())
+            chunk = pending + raw
+            complete_size = len(chunk) - len(chunk) % 3
+            if complete_size:
+                encoded_chunks.append(base64.b64encode(chunk[:complete_size]).decode("ascii"))
+            pending = chunk[complete_size:]
+    if pending:
+        encoded_chunks.append(base64.b64encode(pending).decode("ascii"))
+
+    model_data = {
+        "dimensions": {
+            "embedding": EMBED_DIM,
+            "heads": NUM_HEADS,
+            "headWidth": EMBED_DIM // NUM_HEADS,
+            "ffn": FFN_DIM,
+            "layers": NUM_LAYERS,
+            "context": CONTEXT_LENGTH,
+            "defaultTokens": GENERATION_TOKENS,
+            "temperature": TEMPERATURE,
+        },
+        "vocab": vocab,
+        "tensors": tensor_info,
+        "weights": "".join(encoded_chunks),
+        "variables": variable_ids,
+    }
+    template = Path(__file__).with_name("turbowarp_extension.js").read_text(encoding="utf-8")
+    extension_source = template.replace(
+        "__MODEL_DATA__",
+        json.dumps(model_data, separators=(",", ":"), ensure_ascii=False),
+    )
+
+    def bid(name):
+        return stable_id("fast-block:" + name)
+
+    sprite_svg = b'<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"><rect width="1" height="1" fill="none"/></svg>'
+    flag, ask, say, generate, answer = (bid(name) for name in ("flag", "ask", "say", "generate", "answer"))
+    model_sprite = {
+        "isStage": False,
+        "name": "TinyGPT Scratch",
+        "variables": {
+            variable_ids["storyText"]: ["storyText", ""],
+            variable_ids["progressText"]: ["progressText", "Ready"],
+            variable_ids["progressBar"]: ["progressBar", "░" * 20],
+        },
+        "lists": {},
+        "broadcasts": {},
+        "blocks": {
+            flag: {
+                "opcode": "event_whenflagclicked", "next": ask, "parent": None,
+                "inputs": {}, "fields": {}, "shadow": False, "topLevel": True,
+                "x": 35, "y": 35,
+            },
+            ask: {
+                "opcode": "sensing_askandwait", "next": say, "parent": flag,
+                "inputs": {"QUESTION": [1, [10, "Type a story prompt:"]]},
+                "fields": {}, "shadow": False, "topLevel": False,
+            },
+            say: {
+                "opcode": "looks_say", "next": None, "parent": ask,
+                "inputs": {"MESSAGE": [3, generate, [10, ""]]},
+                "fields": {}, "shadow": False, "topLevel": False,
+            },
+            generate: {
+                "opcode": "tinygpt_generate", "next": None, "parent": say,
+                "inputs": {
+                    "PROMPT": [3, answer, [10, ""]],
+                    "MAX_TOKENS": [1, [4, str(GENERATION_TOKENS)]],
+                    "TEMPERATURE": [1, [4, str(TEMPERATURE)]],
+                },
+                "fields": {}, "shadow": False, "topLevel": False,
+            },
+            answer: {
+                "opcode": "sensing_answer", "next": None, "parent": generate,
+                "inputs": {}, "fields": {}, "shadow": True, "topLevel": False,
+            },
+        },
+        "comments": {}, "currentCostume": 0,
+        "costumes": [costume(sprite_svg, "blank", 0.5, 0.5)], "sounds": [], "volume": 100, "layerOrder": 1,
+        "visible": True, "x": 0, "y": 0, "size": 100,
+        "direction": 90, "draggable": False, "rotationStyle": "all around",
+    }
+
+    track_svg = b'<svg xmlns="http://www.w3.org/2000/svg" width="480" height="360"><rect width="480" height="360" fill="#fff"/><rect x="60" y="30" width="360" height="14" rx="3" fill="#d9e2ec"/></svg>'
+    progress_svg = b'<svg xmlns="http://www.w3.org/2000/svg" width="360" height="14"><rect width="360" height="14" rx="3" fill="#168a5b"/></svg>'
+    progress_flag, progress_goto, progress_size, progress_show, progress_forever, progress_update, progress_reporter, progress_wait = (
+        bid(name) for name in ("bar-flag", "bar-goto", "bar-size", "bar-show", "bar-forever", "bar-update", "bar-value", "bar-wait")
+    )
+    progress_sprite = {
+        "isStage": False, "name": "Generation Progress", "variables": {}, "lists": {},
+        "broadcasts": {},
+        "blocks": {
+            progress_flag: {
+                "opcode": "event_whenflagclicked", "next": progress_goto, "parent": None,
+                "inputs": {}, "fields": {}, "shadow": False, "topLevel": True, "x": 30, "y": 30,
+            },
+            progress_goto: {
+                "opcode": "motion_gotoxy", "next": progress_size, "parent": progress_flag,
+                "inputs": {"X": [1, [4, "-180"]], "Y": [1, [4, "143"]]},
+                "fields": {}, "shadow": False, "topLevel": False,
+            },
+            progress_size: {
+                "opcode": "looks_setsizeto", "next": progress_show, "parent": progress_goto,
+                "inputs": {"SIZE": [1, [4, "0"]]}, "fields": {}, "shadow": False, "topLevel": False,
+            },
+            progress_show: {
+                "opcode": "looks_show", "next": progress_forever, "parent": progress_size,
+                "inputs": {}, "fields": {}, "shadow": False, "topLevel": False,
+            },
+            progress_forever: {
+                "opcode": "control_forever", "next": None, "parent": progress_show,
+                "inputs": {"SUBSTACK": [2, progress_update]}, "fields": {}, "shadow": False, "topLevel": False,
+            },
+            progress_update: {
+                "opcode": "looks_setsizeto", "next": progress_wait, "parent": progress_forever,
+                "inputs": {"SIZE": [3, progress_reporter, [4, "0"]]},
+                "fields": {}, "shadow": False, "topLevel": False,
+            },
+            progress_reporter: {
+                "opcode": "data_variable", "next": None, "parent": progress_update,
+                "inputs": {}, "fields": {"VARIABLE": ["generationProgress", variable_ids["generationProgress"]]},
+                "shadow": False, "topLevel": False,
+            },
+            progress_wait: {
+                "opcode": "control_wait", "next": None, "parent": progress_update,
+                "inputs": {"DURATION": [1, [4, "0.1"]]}, "fields": {}, "shadow": False, "topLevel": False,
+            },
+        },
+        "comments": {}, "currentCostume": 0,
+        "costumes": [costume(progress_svg, "progress", 0, 7)],
+        "sounds": [], "volume": 100, "layerOrder": 2,
+        "visible": True, "x": -180, "y": 143, "size": 0,
+        "direction": 90, "draggable": False, "rotationStyle": "all around",
+    }
+    stage = {
+        "isStage": True, "name": "Stage",
+        "variables": {variable_ids["generationProgress"]: ["generationProgress", 0]},
+        "lists": {}, "broadcasts": {}, "blocks": {}, "comments": {}, "currentCostume": 0,
+        "costumes": [costume(track_svg, "backdrop1", 240, 180)],
+        "sounds": [], "volume": 100, "layerOrder": 0, "tempo": 60,
+        "videoTransparency": 50, "videoState": "on", "textToSpeechLanguage": None,
+    }
+    monitors = []
+    for name, mode, x, y, width, height, value in (
+        ("storyText", "large", 5, 5, 480, 120, ""),
+        ("progressText", "large", 5, 130, 300, 40, "Ready"),
+        ("generationProgress", "default", 370, 20, 120, 30, 0),
+        ("progressBar", "large", 5, 170, 300, 35, "░" * 20),
+    ):
+        variable_id = variable_ids[name]
+        monitors.append({
+            "id": variable_id, "mode": mode, "opcode": "data_variable",
+            "params": {"VARIABLE": variable_id},
+            "spriteName": "Stage" if name == "generationProgress" else "TinyGPT Scratch",
+            "value": value, "width": width, "height": height, "x": x, "y": y,
+            "visible": True, "sliderMin": 0, "sliderMax": 100,
+            "isDiscrete": name != "generationProgress",
+        })
+    project = {
+        "targets": [stage, model_sprite, progress_sprite],
+        "monitors": monitors,
+        "extensions": ["tinygpt"],
+        "meta": {"semver": "3.0.0", "vm": "0.2.0", "agent": "turbowarp-tinygpt-fast"},
+    }
+    return project, track_svg, progress_svg, sprite_svg, extension_source, offset
 
 
 def prune_vocab(vocab, size):
@@ -1717,23 +1944,30 @@ def export(args):
     if len(vocab) != VOCAB_SIZE or any(word is None for word in vocab):
         raise ValueError(f"The source vocabulary must contain at least {VOCAB_SIZE} contiguous token IDs")
     tensors = build_state(torch, state)
-    project, stage_svg, sprite_svg, parameter_count = make_full_native_project(tensors, vocab)
+    project, stage_svg, progress_svg, sprite_svg, extension_source, parameter_count = make_turbowarp_project(torch, tensors, vocab)
     output_path = Path(args.output)
+    extension_path = Path(args.extension_output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    extension_path.parent.mkdir(parents=True, exist_ok=True)
+    extension_path.write_text(extension_source, encoding="utf-8")
     with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
         archive.writestr("project.json", json.dumps(project, separators=(",", ":"), ensure_ascii=False, allow_nan=False))
         archive.writestr(costume(stage_svg, "backdrop1", 240, 180)["md5ext"], stage_svg)
+        archive.writestr(costume(progress_svg, "progress", 0, 7)["md5ext"], progress_svg)
         archive.writestr(costume(sprite_svg, "blank", 0.5, 0.5)["md5ext"], sprite_svg)
-    print(f"Native Scratch project: {output_path}")
-    print(f"Model: {parameter_count:,} unique parameters; {NUM_LAYERS} layers; {EMBED_DIM} embedding; {NUM_HEADS} heads; {FFN_DIM} FFN; {len(vocab)} tokens")
-    print(f"Native Scratch project; generated token count: {GENERATION_TOKENS}")
+    project_json_size = len(json.dumps(project, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+    print(f"TurboWarp project: {output_path}")
+    print(f"Custom extension: {extension_path}")
+    print(f"Model: {parameter_count:,} unique parameters; {NUM_LAYERS} layers; full vocabulary ({len(vocab)} tokens)")
+    print(f"project.json: {project_json_size:,} bytes; generated tokens: {GENERATION_TOKENS}")
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Export a compact TinyGPT Transformer as native Scratch blocks.")
+    parser = argparse.ArgumentParser(description="Export TinyGPT as a fast TurboWarp project and optimized custom extension.")
     parser.add_argument("checkpoint", nargs="?", default="tinygpt.pt")
     parser.add_argument("--vocab", default="vocab.json")
-    parser.add_argument("--output", default="tinygpt_scratch.sb3")
+    parser.add_argument("--output", default="tinygpt_turbowarp.sb3")
+    parser.add_argument("--extension-output", default="tinygpt_turbowarp_extension.js")
     return parser.parse_args()
 
 
